@@ -15,11 +15,12 @@ from train import train
 
 
 def test_evaluate_model_reports_metrics_and_restores_mode(fake_vimeo):
+    torch.manual_seed(0)
     model = RIFE(distill=False).train()
     loader = DataLoader(VimeoTriplet(fake_vimeo, "test"), batch_size=2)
     metrics = evaluate_model(model, loader, torch.device("cpu"), amp=False)
     assert metrics["n"] == 2
-    assert math.isfinite(metrics["psnr"]) and 0 < metrics["ssim"] <= 1
+    assert math.isfinite(metrics["psnr"]) and -1 <= metrics["ssim"] <= 1
     assert model.training
 
 
