@@ -102,11 +102,11 @@ def run(args: argparse.Namespace) -> int:
                 pairs = []
         if pairs:
             count += flush(pairs)
+        writer.close()  # inside the try: a failed final flush must also clean up
     except BaseException:
         writer.abort()
         frames.close()
         raise
-    writer.close()
     if count == 1:
         print("warning: input has a single frame; output is a copy", file=sys.stderr)
     print(f"wrote {count} frames at {float(info.fps * args.factor):.3f} fps to {out_path}")
