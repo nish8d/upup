@@ -31,13 +31,23 @@ def _fraction(text: str) -> Fraction:
     return Fraction(int(num), int(den)) if int(den) else Fraction(0)
 
 
+def _rotation(stream: dict) -> float:
+    for side in stream.get("side_data_list", []):
+        if "rotation" in side:
+            return float(side["rotation"])
+    try:
+        return float(stream.get("tags", {}).get("rotate", 0))  # legacy tag
+    except ValueError:
+        return 0.0
+
+
 def probe(path) -> VideoInfo:
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"input video not found: {path}")
     res = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,width,height,r_frame_rate,avg_frame_rate",
-         "-of", "json", str(path)],
+         "-show_entries", "stream_side_data=rotation:stream_tags=rotate", "-of", "json", str(path)],
         capture_output=True, text=True,
     )
     if res.returncode != 0:
@@ -52,9 +62,14 @@ def probe(path) -> VideoInfo:
     if fps <= 0:
         raise ValueError(f"could not determine the frame rate of {path}")
     vfr = r_rate > 0 and avg_rate > 0 and abs(r_rate - avg_rate) / r_rate > 0.01
+    width, height = int(video["width"]), int(video["height"])
+    # ffmpeg autorotates on decode, so the pixels it pipes out have the displayed (rotated) size,
+    # not the coded size ffprobe reports. Phone portrait clips are the common case.
+    if abs(_rotation(video)) % 180 == 90:
+        width, height = height, width
     return VideoInfo(
-        width=int(video["width"]),
-        height=int(video["height"]),
+        width=width,
+        height=height,
         fps=fps,
         has_audio=any(s.get("codec_type") == "audio" for s in streams),
         variable_frame_rate=vfr,
@@ -62,7 +77,8 @@ def probe(path) -> VideoInfo:
 
 
 def read_frames(path, info: VideoInfo) -> Iterator[np.ndarray]:
-    cmd = ["ffmpeg", "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    # -map 0:v:0 makes the decoded stream the same one probe() measured.
+    cmd = ["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     frame_bytes = info.width * info.height * 3
     try:
@@ -78,16 +94,23 @@ def read_frames(path, info: VideoInfo) -> Iterator[np.ndarray]:
 
 class FrameWriter:
     def __init__(self, path, width: int, height: int, fps: Fraction, audio_source=None, crf: int = 18):
+        self.path = Path(path)
         cmd = ["ffmpeg", "-v", "error", "-y",
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
                "-r", f"{fps.numerator}/{fps.denominator}", "-i", "-"]
         if audio_source is not None:
             # "1:a?" = copy audio if the source has any; duration is unchanged so it stays in sync.
             cmd += ["-i", str(audio_source), "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy"]
+        filters = []
         if width % 2 or height % 2:
             # H.264 with 4:2:0 chroma needs even dimensions; pad one pixel rather than crop.
-            cmd += ["-vf", f"pad={width + width % 2}:{height + height % 2}"]
-        cmd += ["-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", str(path)]
+            filters.append(f"pad={width + width % 2}:{height + height % 2}")
+        # ffmpeg's default RGB->YUV matrix is BT.601, but players assume BT.709 for HD; convert
+        # with 709 explicitly and tag the stream so colours match the source.
+        filters.append("scale=out_color_matrix=bt709:out_range=tv")
+        cmd += ["-vf", ",".join(filters)]
+        cmd += ["-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p",
+                "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", str(path)]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def write(self, frame: np.ndarray) -> None:
@@ -98,11 +121,17 @@ class FrameWriter:
             raise
 
     def close(self) -> None:
-        self.proc.stdin.close()
-        err = self.proc.stderr.read().decode(errors="replace")
-        if self.proc.wait() != 0:
-            raise RuntimeError(f"ffmpeg encoding failed: {err.strip()}")
+        try:
+            self.proc.stdin.close()
+        except BrokenPipeError:  # ffmpeg already died; its stderr below says why
+            pass
+        self.proc.stdin = None  # communicate() would otherwise try to flush the closed pipe
+        _, err = self.proc.communicate()  # also closes the stderr pipe
+        if self.proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg encoding failed: {err.decode(errors='replace').strip()}")
 
     def abort(self) -> None:
+        """Stop encoding and delete the unusable partial output."""
         self.proc.kill()
-        self.proc.wait()
+        self.proc.communicate()
+        self.path.unlink(missing_ok=True)

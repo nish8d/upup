@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from interpolate import is_scene_cut, main
+from interpolate import default_output_path, is_scene_cut, main, parse_args
 from rife.checkpoint import save_checkpoint
 from rife.model import RIFE
 from rife.video import probe, read_frames
@@ -131,3 +131,68 @@ def test_missing_checkpoint_is_a_clean_error(tmp_path, capsys):
 def test_missing_input_is_a_clean_error(tmp_path, ckpt, capsys):
     assert run_cli(tmp_path / "missing.mp4", tmp_path / "out.mp4", ckpt) == 1
     assert "input video not found" in capsys.readouterr().err
+
+
+def test_rotated_video_is_upright_and_complete(tmp_path, ckpt):
+    base = make_video(tmp_path / "base.mp4")  # 160x96 coded size
+    rotated = tmp_path / "rot.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-display_rotation", "90", "-i", str(base),
+                    "-c", "copy", str(rotated)], check=True)
+    assert probe(rotated).width == 96 and probe(rotated).height == 160  # ffmpeg autorotates on decode
+    assert run_cli(rotated, tmp_path / "out.mp4", ckpt) == 0
+    info = inspect(tmp_path / "out.mp4")
+    assert info["frames"] == 19
+    assert info["size"] == (96, 160)
+
+
+def test_output_is_tagged_bt709(tmp_path, ckpt):
+    src = make_video(tmp_path / "in.mp4", frames=3)
+    assert run_cli(src, tmp_path / "out.mp4", ckpt) == 0
+    res = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=color_space",
+                          "-of", "csv=p=0", str(tmp_path / "out.mp4")], capture_output=True, text=True, check=True)
+    assert res.stdout.strip() == "bt709"
+
+
+def test_default_output_name_is_always_writable_container(tmp_path):
+    assert default_output_path(tmp_path / "clip.webm", 2) == tmp_path / "clip_2x.mp4"
+    assert default_output_path(tmp_path / "clip.avi", 4) == tmp_path / "clip_4x.mp4"
+    assert default_output_path(tmp_path / "clip.mkv", 2) == tmp_path / "clip_2x.mkv"
+    assert default_output_path(tmp_path / "clip.MOV", 8) == tmp_path / "clip_8x.mov"
+
+
+def test_out_equal_to_input_is_refused(tmp_path, ckpt, capsys):
+    src = make_video(tmp_path / "in.mp4", frames=3)
+    size = src.stat().st_size
+    assert run_cli(src, src, ckpt) == 1
+    assert "same file" in capsys.readouterr().err
+    assert src.stat().st_size == size
+
+
+def test_failure_mid_stream_removes_partial_output(tmp_path, ckpt, monkeypatch):
+    import interpolate
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(interpolate, "interpolate_recursive", boom)
+    src = make_video(tmp_path / "in.mp4", frames=3)
+    out = tmp_path / "out.mp4"
+    assert run_cli(src, out, ckpt) == 1
+    assert not out.exists()
+
+
+def test_cuda_oom_gives_a_hint(tmp_path, ckpt, monkeypatch, capsys):
+    import interpolate
+
+    def oom(*args, **kwargs):
+        raise torch.OutOfMemoryError("out of memory")
+
+    monkeypatch.setattr(interpolate, "interpolate_recursive", oom)
+    src = make_video(tmp_path / "in.mp4", frames=3)
+    assert run_cli(src, tmp_path / "out.mp4", ckpt) == 1
+    assert "--scale 0.5" in capsys.readouterr().err
+
+
+def test_batch_must_be_positive():
+    with pytest.raises(SystemExit):
+        parse_args(["in.mp4", "--ckpt", "c.pt", "--batch", "0"])

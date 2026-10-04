@@ -29,15 +29,30 @@ def _to_frames(t: torch.Tensor) -> list[np.ndarray]:
     return list((t * 255).round().clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy())
 
 
+def default_output_path(input_path: Path, factor: int) -> Path:
+    # Keep the input's container only if libx264 can go into it (e.g. not .webm or .avi).
+    suffix = input_path.suffix.lower()
+    if suffix not in (".mp4", ".mkv", ".mov"):
+        suffix = ".mp4"
+    return input_path.with_name(f"{input_path.stem}_{factor}x{suffix}")
+
+
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Frame-rate up-conversion with RIFE.")
     p.add_argument("input", type=Path)
     p.add_argument("--ckpt", required=True, type=Path)
     p.add_argument("--factor", type=int, choices=sorted(DEPTH), default=2)
-    p.add_argument("--out", type=Path, help="default: <input stem>_<factor>x<suffix>")
+    p.add_argument("--out", type=Path, help="default: <input stem>_<factor>x.mp4 (.mkv/.mov inputs keep their container)")
     p.add_argument("--scale", type=float, choices=[1.0, 0.5, 0.25], default=1.0,
                    help="flow resolution; use 0.5 for 1080p+ to save memory and time")
-    p.add_argument("--batch", type=int, default=4, help="frame pairs per GPU batch")
+    p.add_argument("--batch", type=_positive_int, default=4, help="frame pairs per GPU batch")
     p.add_argument("--scene-threshold", type=float, default=0.2,
                    help="mean abs difference (0-1) above which a pair is treated as a scene cut")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -51,7 +66,9 @@ def run(args: argparse.Namespace) -> int:
         print("warning: variable frame rate input; output timing will be approximate", file=sys.stderr)
     device = torch.device(args.device)
     model = load_model_for_inference(args.ckpt, device)
-    out_path = args.out or args.input.with_name(f"{args.input.stem}_{args.factor}x{args.input.suffix}")
+    out_path = args.out or default_output_path(args.input, args.factor)
+    if out_path.resolve() == args.input.resolve():
+        raise ValueError(f"output and input are the same file ({out_path}); choose a different --out")
     depth = DEPTH[args.factor]
 
     frames = read_frames(args.input, info)
@@ -87,6 +104,7 @@ def run(args: argparse.Namespace) -> int:
             count += flush(pairs)
     except BaseException:
         writer.abort()
+        frames.close()
         raise
     writer.close()
     if count == 1:
@@ -99,6 +117,9 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     try:
         run(args)
+    except torch.OutOfMemoryError:  # listed first: it subclasses RuntimeError
+        print("error: out of GPU memory — try --scale 0.5 and/or --batch 1", file=sys.stderr)
+        return 1
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
