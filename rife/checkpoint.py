@@ -42,7 +42,8 @@ def load_checkpoint(path, model, optimizer=None, scaler=None, restore_rng: bool 
         ) from e
     if optimizer is not None and ckpt.get("optimizer") is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
-    if scaler is not None and ckpt.get("scaler") is not None:
+    # A disabled GradScaler (bf16 run) saves {}; loading that into an enabled one would raise.
+    if scaler is not None and ckpt.get("scaler"):
         scaler.load_state_dict(ckpt["scaler"])
     if restore_rng:
         rng = ckpt["rng"]
@@ -50,5 +51,7 @@ def load_checkpoint(path, model, optimizer=None, scaler=None, restore_rng: bool 
         np.random.set_state(rng["numpy"])
         torch.set_rng_state(rng["torch"])
         if rng["cuda"] is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(rng["cuda"])
+            # The saved GPU count may differ from this machine's; restore the overlapping devices.
+            for i, state in enumerate(rng["cuda"][: torch.cuda.device_count()]):
+                torch.cuda.set_rng_state(state, i)
     return {"step": ckpt["step"], "best_psnr": ckpt["best_psnr"], "config": ckpt["config"]}

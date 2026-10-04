@@ -47,7 +47,7 @@ def train(
 
     use_amp = cfg.amp and device.type == "cuda"
     # bf16 needs no loss scaling; GPUs without bf16 (Kaggle T4/P100) fall back to fp16 + GradScaler.
-    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
+    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported(including_emulation=False) else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
 
     model = RIFE(distill=cfg.distill, refine=cfg.refine).to(device)

@@ -42,3 +42,23 @@ def test_architecture_mismatch_is_reported(tmp_path):
     save_checkpoint(tmp_path / "c.pt", RIFE(refine=False), None, 0, 0.0, {})
     with pytest.raises(RuntimeError, match="incompatible checkpoint"):
         load_checkpoint(tmp_path / "c.pt", RIFE(refine=True))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_disabled_scaler_checkpoint_loads_into_enabled_scaler(tmp_path):
+    model, opt = _trained_pair()
+    save_checkpoint(tmp_path / "c.pt", model, opt, 1, 0.0, {}, torch.amp.GradScaler("cuda", enabled=False))
+    scaler = torch.amp.GradScaler("cuda", enabled=True)
+    load_checkpoint(tmp_path / "c.pt", RIFE(distill=True, refine=False), scaler=scaler)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_checkpoint_from_machine_with_more_gpus_loads(tmp_path):
+    model, opt = _trained_pair()
+    path = tmp_path / "c.pt"
+    save_checkpoint(path, model, opt, 1, 0.0, {})
+    state = torch.load(path, weights_only=False)
+    state["rng"]["cuda"] = state["rng"]["cuda"] + [state["rng"]["cuda"][0]]
+    assert len(state["rng"]["cuda"]) == torch.cuda.device_count() + 1
+    torch.save(state, path)
+    load_checkpoint(path, RIFE(distill=True, refine=False))
