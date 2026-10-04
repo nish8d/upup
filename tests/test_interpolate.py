@@ -10,7 +10,7 @@ import torch
 from interpolate import default_output_path, is_scene_cut, main, parse_args
 from rife.checkpoint import save_checkpoint
 from rife.model import RIFE
-from rife.video import probe, read_frames
+from rife.video import FrameWriter, probe, read_frames
 
 pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 
@@ -196,3 +196,26 @@ def test_cuda_oom_gives_a_hint(tmp_path, ckpt, monkeypatch, capsys):
 def test_batch_must_be_positive():
     with pytest.raises(SystemExit):
         parse_args(["in.mp4", "--ckpt", "c.pt", "--batch", "0"])
+
+
+def test_ffmpeg_failure_reports_ffmpeg_error(tmp_path, ckpt, capsys):
+    # The output directory doesn't exist, so the encoder dies on start-up.
+    src = make_video(tmp_path / "in.mp4", frames=3)
+    assert run_cli(src, tmp_path / "missing_dir" / "out.mp4", ckpt) == 1
+    err = capsys.readouterr().err
+    assert "ffmpeg encoding failed" in err
+    assert "closed file" not in err
+
+
+def test_abort_after_failed_close_cleans_up(tmp_path):
+    out = tmp_path / "out.mp4"
+    writer = FrameWriter(out, 16, 16, Fraction(10))
+    writer.write(np.zeros((16, 16, 3), np.uint8))
+    writer.proc.kill()  # simulate ffmpeg dying mid-stream (e.g. disk full)
+    with pytest.raises(RuntimeError, match="ffmpeg encoding failed"):
+        for _ in range(10_000):  # until the pipe buffer fills and the write fails
+            writer.write(np.zeros((16, 16, 3), np.uint8))
+        writer.close()
+    writer.abort()  # must not raise after close() already ran
+    writer.abort()  # and must be safe to call twice
+    assert not out.exists()

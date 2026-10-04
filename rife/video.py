@@ -131,7 +131,18 @@ class FrameWriter:
             raise RuntimeError(f"ffmpeg encoding failed: {err.decode(errors='replace').strip()}")
 
     def abort(self) -> None:
-        """Stop encoding and delete the unusable partial output."""
-        self.proc.kill()
-        self.proc.communicate()
-        self.path.unlink(missing_ok=True)
+        """Stop encoding and delete the unusable partial output. Safe after close()."""
+        try:
+            # close() may already have reaped ffmpeg and closed its pipes; a second
+            # communicate() would then fail with "read of closed file".
+            if self.proc.returncode is None:
+                self.proc.kill()
+                if self.proc.stdin:
+                    try:
+                        self.proc.stdin.close()
+                    except BrokenPipeError:
+                        pass
+                    self.proc.stdin = None
+                self.proc.communicate()
+        finally:
+            self.path.unlink(missing_ok=True)
