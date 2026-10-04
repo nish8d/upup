@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 import pytest
 
+from rife.config import TrainConfig
+
 SEQUENCES = ["00001/0001", "00001/0002", "00002/0001", "00002/0002"]
 
 
@@ -19,3 +21,19 @@ def fake_vimeo(tmp_path):
     (root / "tri_trainlist.txt").write_text("\n".join(SEQUENCES) + "\n")
     (root / "tri_testlist.txt").write_text("\n".join(SEQUENCES[:2]) + "\n")
     return root
+
+
+@pytest.fixture
+def make_cfg(fake_vimeo, tmp_path):
+    """Tiny CPU-friendly training config over fake_vimeo; pass overrides as kwargs."""
+
+    def _make(**overrides):
+        values = dict(
+            name="test", data_root=str(fake_vimeo), out_dir=str(tmp_path / "runs"),
+            batch_size=2, crop=64, num_workers=0, pin_memory=False, amp=False,
+            total_steps=4, warmup_steps=2, val_every=1000, val_subset=2, ckpt_every=1000, log_every=1,
+        )
+        values.update(overrides)
+        return TrainConfig(**values)
+
+    return _make
