@@ -30,6 +30,19 @@ class TrainConfig:
     log_every: int = 50
     seed: int = 0
 
+    def __post_init__(self) -> None:
+        at_least_one = ("batch_size", "accum_steps", "total_steps", "val_every", "val_subset",
+                        "ckpt_every", "log_every")
+        for key in at_least_one:
+            if getattr(self, key) < 1:
+                raise ValueError(f"{key} must be at least 1, got {getattr(self, key)}")
+        if self.warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be >= 0, got {self.warmup_steps}")
+        if self.warmup_steps >= self.total_steps:
+            raise ValueError(f"warmup_steps ({self.warmup_steps}) must be less than total_steps ({self.total_steps})")
+        if self.lr_min > self.lr_max:
+            raise ValueError(f"lr_min ({self.lr_min}) must not exceed lr_max ({self.lr_max})")
+
     @property
     def run_dir(self) -> Path:
         return Path(self.out_dir) / self.name

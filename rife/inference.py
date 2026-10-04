@@ -38,7 +38,10 @@ def load_model_for_inference(path, device) -> RIFE:
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"checkpoint not found: {path}")
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as e:  # truncated/garbage files surface as UnpicklingError, zip or EOF errors
+        raise ValueError(f"could not read checkpoint {path}: {e}") from e
     if not isinstance(ckpt, dict) or "model" not in ckpt or "config" not in ckpt:
         raise ValueError(f"{path} is not a RIFE checkpoint (missing 'model'/'config')")
     model = RIFE(distill=False, refine=bool(ckpt["config"].get("refine", False)))

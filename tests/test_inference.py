@@ -40,3 +40,9 @@ def test_load_model_errors(tmp_path):
     torch.save({"foo": 1}, tmp_path / "junk.pt")
     with pytest.raises(ValueError, match="not a RIFE checkpoint"):
         load_model_for_inference(tmp_path / "junk.pt", "cpu")
+
+
+def test_corrupt_checkpoint_is_a_clear_error(tmp_path):
+    (tmp_path / "bad.pt").write_bytes(b"this is not a checkpoint")
+    with pytest.raises(ValueError, match="could not read checkpoint"):
+        load_model_for_inference(tmp_path / "bad.pt", "cpu")

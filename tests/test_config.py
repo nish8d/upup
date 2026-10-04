@@ -47,3 +47,13 @@ def test_lr_schedule_shape():
     assert lr_at(110, **kw) == pytest.approx(1e-4)
     after_warmup = [lr_at(s, **kw) for s in range(10, 111)]
     assert all(a >= b for a, b in zip(after_warmup, after_warmup[1:]))
+
+
+@pytest.mark.parametrize("bad", [
+    dict(accum_steps=0), dict(batch_size=0), dict(val_every=0), dict(ckpt_every=0), dict(log_every=0),
+    dict(val_subset=0), dict(total_steps=0), dict(warmup_steps=-1),
+    dict(total_steps=100, warmup_steps=100), dict(lr_min=1e-2, lr_max=1e-3),
+])
+def test_invalid_values_are_rejected(bad):
+    with pytest.raises(ValueError, match=next(iter(bad))):
+        TrainConfig(name="run", data_root="d", **bad)

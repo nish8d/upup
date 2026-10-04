@@ -38,6 +38,7 @@ class IFBlock(nn.Module):
         feat = self.down(x)  # 1/(4·scale)
         feat = self.body(feat) + feat
         out = self.up(feat)  # 1/(2·scale)
-        # Cast to fp32: flows are summed across blocks and bf16 would lose sub-pixel precision.
-        out = resize(out, (h, w)).float()
+        # Cast to fp32 *before* upsampling: flows are summed across blocks and bf16/fp16 would lose
+        # sub-pixel precision.
+        out = resize(out.float(), (h, w))
         return out[:, :4] * (2 * scale), out[:, 4:5]
