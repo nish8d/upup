@@ -6,6 +6,7 @@ Usage:
     python train.py --config configs/ablation_2_distill.yaml --max-steps 300 --name pilot
 """
 import argparse
+import math
 import random
 import signal
 import time
@@ -23,6 +24,14 @@ from rife.evaluation import evaluate_model
 from rife.loss import compute_losses
 from rife.model import RIFE
 from rife.schedule import lr_at
+
+
+# Settings that determine the data order, schedule or model; changing them breaks exact resume.
+RESUME_SENSITIVE = ("batch_size", "accum_steps", "seed", "total_steps", "warmup_steps",
+                    "lr_max", "lr_min", "distill", "refine", "crop")
+
+
+MAX_NONFINITE_STREAK = 10
 
 
 def _ignore_sigint(_worker_id: int) -> None:
@@ -57,6 +66,13 @@ def train(
         state = load_checkpoint(resume, model, optimizer, scaler)
         step, best_psnr = state["step"], state["best_psnr"]
         print(f"resumed from {resume} at step {step}")
+        current = cfg.to_dict()
+        drift = {k: (state["config"].get(k), current[k]) for k in RESUME_SENSITIVE
+                 if state["config"].get(k) != current[k]}
+        if drift:
+            changes = ", ".join(f"{k}: {old} -> {new}" for k, (old, new) in drift.items())
+            print(f"warning: config differs from the checkpoint's ({changes}); "
+                  "exact resume is no longer guaranteed")
 
     samples_per_step = cfg.batch_size * cfg.accum_steps
     train_set = VimeoTriplet(cfg.data_root, "train", crop=cfg.crop, augment=True)
@@ -78,10 +94,11 @@ def train(
     def request_stop(signum, frame):
         nonlocal stop_requested
         stop_requested = True
+        signal.signal(signal.SIGINT, previous_handler)  # a second Ctrl-C interrupts immediately
         print("\nCtrl-C received: finishing this step and saving last.pt ...")
 
     previous_handler = signal.signal(signal.SIGINT, request_stop)
-    writer = SummaryWriter(str(run_dir / "tb"))
+    writer = SummaryWriter(str(run_dir / "tb"), purge_step=step if resume else None)  # drop stale points after resume
     end_step = cfg.total_steps if max_steps is None else min(cfg.total_steps, step + max_steps)
     history: list[float] = []
     data_iter = iter(loader)
@@ -93,6 +110,7 @@ def train(
 
     model.train()
     t_last = time.perf_counter()
+    nonfinite_total = nonfinite_streak = 0
     try:
         while step < end_step and not stop_requested:
             lr = lr_at(step, cfg.warmup_steps, cfg.total_steps, cfg.lr_max, cfg.lr_min)
@@ -107,8 +125,22 @@ def train(
                 scaler.scale(losses["total"] / cfg.accum_steps).backward()
                 for key, value in losses.items():
                     totals[key] = totals.get(key, 0.0) + value.item() / cfg.accum_steps
-            scaler.step(optimizer)
-            scaler.update()
+            if math.isfinite(totals["total"]):
+                nonfinite_streak = 0
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # bf16 has no GradScaler to skip bad steps, and one NaN update would poison every weight.
+                # The step still counts so the data position (step × samples_per_step) stays exact.
+                nonfinite_total += 1
+                nonfinite_streak += 1
+                writer.add_scalar("train/nonfinite_steps", nonfinite_total, step + 1)
+                print(f"warning: non-finite loss at step {step + 1}; skipping the update")
+                if nonfinite_streak >= MAX_NONFINITE_STREAK:
+                    raise RuntimeError(
+                        f"loss was non-finite for {MAX_NONFINITE_STREAK} consecutive steps (step {step + 1}); "
+                        "aborting without overwriting last.pt. Lower lr_max or inspect the data."
+                    )
             optimizer.zero_grad(set_to_none=True)
             step += 1
             history.append(totals["total"])

@@ -11,6 +11,7 @@ from rife.data import VimeoTriplet
 from rife.evaluation import evaluate_model
 from rife.loss import compute_losses
 from rife.model import RIFE
+import train as train_module
 from train import train
 
 
@@ -52,6 +53,63 @@ def test_ctrl_c_saves_checkpoint_and_stops(make_cfg):
     result = train(cfg, device="cpu", on_step_end=interrupt)
     assert result["step"] == 2
     assert torch.load(cfg.run_dir / "last.pt", weights_only=False)["step"] == 2
+    assert signal.getsignal(signal.SIGINT) is handler_before
+
+
+def _nan_losses(real, bad_calls):
+    """Wrap compute_losses so the listed (0-based) calls return a NaN loss that still has a graph."""
+    calls = {"n": 0}
+
+    def wrapped(*args, **kwargs):
+        losses = real(*args, **kwargs)
+        calls["n"] += 1
+        if bad_calls is None or calls["n"] - 1 in bad_calls:
+            losses = {k: v + float("nan") for k, v in losses.items()}
+        return losses
+
+    return wrapped
+
+
+def test_single_nonfinite_step_is_skipped(make_cfg, monkeypatch, capsys):
+    monkeypatch.setattr(train_module, "compute_losses", _nan_losses(compute_losses, {1}))
+    cfg = make_cfg()
+    result = train(cfg, device="cpu")
+    assert result["step"] == 4  # the skipped step still counts, so resume data positions stay exact
+    assert math.isnan(result["history"][1]) and all(math.isfinite(h) for h in result["history"][2:])
+    ckpt = torch.load(cfg.run_dir / "last.pt", weights_only=False)
+    assert all(torch.isfinite(v).all() for v in ckpt["model"].values() if v.is_floating_point())
+    assert "non-finite" in capsys.readouterr().out
+
+
+def test_persistent_nonfinite_loss_aborts_without_saving(make_cfg, monkeypatch):
+    monkeypatch.setattr(train_module, "compute_losses", _nan_losses(compute_losses, None))
+    cfg = make_cfg(total_steps=20, warmup_steps=2)
+    handler_before = signal.getsignal(signal.SIGINT)
+    with pytest.raises(RuntimeError, match="non-finite"):
+        train(cfg, device="cpu")
+    assert not (cfg.run_dir / "last.pt").exists()
+    assert signal.getsignal(signal.SIGINT) is handler_before
+
+
+def test_resume_warns_about_config_drift(make_cfg, capsys):
+    cfg = make_cfg(name="drift")
+    train(cfg, max_steps=2, device="cpu")
+    capsys.readouterr()
+    train(make_cfg(name="drift", lr_max=1e-4), resume=str(cfg.run_dir / "last.pt"), device="cpu")
+    assert "lr_max" in capsys.readouterr().out
+
+
+def test_second_ctrl_c_still_interrupts(make_cfg):
+    cfg = make_cfg(total_steps=10)
+    handler_before = signal.getsignal(signal.SIGINT)
+
+    def interrupt_twice(step):
+        if step == 2:
+            os.kill(os.getpid(), signal.SIGINT)
+            os.kill(os.getpid(), signal.SIGINT)
+
+    with pytest.raises(KeyboardInterrupt):
+        train(cfg, device="cpu", on_step_end=interrupt_twice)
     assert signal.getsignal(signal.SIGINT) is handler_before
 
 
